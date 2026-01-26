@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <cstddef>
+#include <cerrno>
 #include <cstdint>
 #include <random>
 #include <thread>
@@ -29,6 +30,18 @@
 #include "absl/strings/str_join.h"
 #include "log.h"
 #include "two_color.h"
+
+#ifndef TEMP_FAILURE_RETRY
+// Musl doesn't provide TEMP_FAILURE_RETRY; emulate it without GNU extensions.
+#define TEMP_FAILURE_RETRY(expr) \
+  ([&]() {                        \
+    auto _rc = (expr);            \
+    while (_rc == -1 && errno == EINTR) { \
+      _rc = (expr);               \
+    }                             \
+    return _rc;                   \
+  }())
+#endif
 
 ABSL_FLAG(bool, ignore_affinity_failure, false,
           "Silently ignore affinity failure");
