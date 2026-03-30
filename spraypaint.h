@@ -44,6 +44,7 @@ class SprayPaint {
 
   // Returns decoded color (as modular values), or 'Garbage' if invalid.
   std::string CrackColor(uint8_t color) const;
+  std::string DescribeIdentity(const TwoColor::Identity& identity) const;
   const uint8_t *buffer() const { return buffer_; }
   size_t buffer_size() const { return buffer_size_; }
 
@@ -79,8 +80,29 @@ class SprayPaint {
   // Returns null_ptr on error.
   uint8_t *MappedBuffer(size_t id) const;
 
+  size_t CurrentIdentity() const;
+  size_t EpochForRound(int round, size_t salt = 0) const;
+  size_t EncodeIdentity(size_t owner, size_t epoch) const;
+  void PaintPattern(size_t identity, size_t buffer_id, uint8_t *buffer,
+                    size_t buffer_size, size_t base_position = 0) const;
+  bool PatternIsRight(size_t identity, size_t buffer_id, const uint8_t *buffer,
+                      size_t buffer_size, const std::string &ident,
+                      size_t base_position = 0) const;
+  bool BufferIsZeroFilled(const uint8_t *buffer, size_t buffer_size,
+                          const std::string &ident) const;
   void CacheHotlineBuffer(const uint8_t *buffer, size_t buffer_size) const;
+  void TouchPages(const uint8_t *buffer, size_t buffer_size) const;
   bool RunLoadStoreStress(int round);
+  bool RunMadviseReclaimStress(int round);
+  bool RunVmaSurgeryStress(int round);
+  bool RunProcessVmTransferStress(int round);
+  bool RunZeroCopyPipeStress(int round);
+  bool RunMemfdAliasStress(int round);
+  bool RunForkTreeStress(int round);
+  bool RunForkTreeNode(uint8_t *buffer, size_t buffer_size, int round,
+                       size_t depth, size_t lineage, size_t identity,
+                       size_t buffer_id);
+  bool RunThpKsmStress(int round);
 
   std::string Ident(const std::string &phase, size_t buffer_id) const;
 
@@ -91,6 +113,7 @@ class SprayPaint {
   int round_ = 0;
   int kid_ = 0;
   int last_painted_by_ = 0;
+  size_t current_epoch_ = 0;
   uint8_t *buffer_;
   std::vector<uint8_t> load_store_source_;
   std::vector<uint8_t> load_store_target_;

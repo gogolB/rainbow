@@ -37,8 +37,22 @@ int main() {
   stress_plan.cache_line_size = 64;
   stress_plan.cache_hotline = true;
   stress_plan.cache_hotline_passes = 2;
-  stress_plan.load_store_bytes = 256 * 1024;
+  stress_plan.epoch_coloring = true;
+  stress_plan.epoch_stride = 32;
+  stress_plan.epoch_modulus = 8;
+  stress_plan.load_store_bytes = 64 * 1024;
   stress_plan.load_store_passes = 2;
+  stress_plan.madvise_reclaim = true;
+  stress_plan.madvise_passes = 1;
+  stress_plan.vma_surgery = true;
+  stress_plan.vma_passes = 1;
+  stress_plan.process_vm_transfer = true;
+  stress_plan.zero_copy_pipe = true;
+  stress_plan.memfd_alias = true;
+  stress_plan.fork_tree = true;
+  stress_plan.fork_tree_depth = 1;
+  stress_plan.thp_ksm = true;
+  stress_plan.thp_region_bytes = 2 * 1024 * 1024;
 
   AffinedSprayPaint stressed(8192, stress_plan);
   ok &= Expect(stressed.ColorIsRight("SelfTestCtor"),

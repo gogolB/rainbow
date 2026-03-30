@@ -15,7 +15,9 @@ namespace {
 
 constexpr size_t kKiB = 1024;
 constexpr size_t kMiB = 1024 * kKiB;
+constexpr size_t kHugePageSize = 2 * kMiB;
 constexpr size_t kDefaultCacheLineSize = 64;
+constexpr size_t kTwoColorIdentitySpace = 29 * 31;
 constexpr char kCpuOnlinePath[] = "/sys/devices/system/cpu/online";
 constexpr char kCacheRootPath[] = "/sys/devices/system/cpu/cpu0/cache";
 
@@ -151,14 +153,55 @@ std::string SystemTopology::Summary() const {
   return out.str();
 }
 
+bool StressPlan::HasKernelSdcModes() const {
+  return madvise_reclaim || vma_surgery || process_vm_transfer ||
+         zero_copy_pipe || memfd_alias || fork_tree || thp_ksm;
+}
+
 std::string StressPlan::Summary() const {
   std::ostringstream out;
   out << "prescan=" << (prescan_applied ? "on" : "off")
       << " line_size=" << cache_line_size
       << " cache_hotline=" << (cache_hotline ? "on" : "off")
       << " hotline_passes=" << cache_hotline_passes
+      << " epoch_coloring=" << (epoch_coloring ? "on" : "off")
+      << " epoch_stride=" << epoch_stride
+      << " epoch_modulus=" << epoch_modulus
       << " load_store_bytes=" << FormatBytes(load_store_bytes)
       << " load_store_passes=" << load_store_passes;
+  if (HasKernelSdcModes()) {
+    out << " modes=[";
+    bool first = true;
+    auto append_mode = [&](const std::string& mode) {
+      if (!first) {
+        out << ',';
+      }
+      out << mode;
+      first = false;
+    };
+    if (madvise_reclaim) {
+      append_mode("madvise:" + std::to_string(madvise_passes));
+    }
+    if (vma_surgery) {
+      append_mode("vma:" + std::to_string(vma_passes));
+    }
+    if (process_vm_transfer) {
+      append_mode("process_vm");
+    }
+    if (zero_copy_pipe) {
+      append_mode("zero_copy_pipe");
+    }
+    if (memfd_alias) {
+      append_mode("memfd_alias");
+    }
+    if (fork_tree) {
+      append_mode("fork_tree:" + std::to_string(fork_tree_depth));
+    }
+    if (thp_ksm) {
+      append_mode("thp_ksm:" + FormatBytes(thp_region_bytes));
+    }
+    out << "]";
+  }
   return out.str();
 }
 
@@ -208,21 +251,18 @@ std::optional<SystemTopology> PrescanSystemTopology() {
 
 StressPlan BuildStressPlan(size_t buffer_size,
                            const std::optional<SystemTopology>& topology,
-                           bool enable_cache_hotline,
-                           size_t cache_hotline_passes,
-                           size_t requested_load_store_bytes,
-                           size_t requested_load_store_passes) {
+                           const StressOptions& options) {
   StressPlan plan;
   plan.prescan_applied = topology.has_value();
   plan.cache_line_size = topology.has_value()
                              ? std::max(kDefaultCacheLineSize,
                                         topology->MaxCacheLineSize())
                              : kDefaultCacheLineSize;
-  plan.cache_hotline = enable_cache_hotline;
-  plan.cache_hotline_passes = enable_cache_hotline
-                                  ? std::max<size_t>(1, cache_hotline_passes)
+  plan.cache_hotline = options.enable_cache_hotline;
+  plan.cache_hotline_passes = options.enable_cache_hotline
+                                  ? std::max<size_t>(1, options.cache_hotline_passes)
                                   : 0;
-  plan.load_store_passes = requested_load_store_passes;
+  plan.load_store_passes = options.requested_load_store_passes;
 
   size_t recommended_bytes = buffer_size;
   if (topology.has_value()) {
@@ -237,13 +277,52 @@ StressPlan BuildStressPlan(size_t buffer_size,
   recommended_bytes = std::max(recommended_bytes, 256 * kKiB);
   recommended_bytes = std::min(recommended_bytes, 8 * kMiB);
 
-  if (requested_load_store_bytes != 0) {
-    plan.load_store_bytes = requested_load_store_bytes;
+  if (options.requested_load_store_bytes != 0) {
+    plan.load_store_bytes = options.requested_load_store_bytes;
   } else {
     plan.load_store_bytes = recommended_bytes;
   }
   plan.load_store_bytes =
       AlignUp(std::max(plan.load_store_bytes, buffer_size), plan.cache_line_size);
+
+  const size_t concurrency = std::max<size_t>(
+      1, topology.has_value()
+             ? std::max(topology->online_cpus, topology->hardware_threads)
+             : std::thread::hardware_concurrency());
+  size_t epoch_stride = options.requested_epoch_stride;
+  if (epoch_stride == 0) {
+    epoch_stride = std::max<size_t>(32, concurrency + 8);
+  }
+  epoch_stride = std::min(epoch_stride, kTwoColorIdentitySpace - 1);
+  plan.epoch_stride = std::max<size_t>(1, epoch_stride);
+  plan.epoch_modulus =
+      std::max<size_t>(1, (kTwoColorIdentitySpace - 1) / plan.epoch_stride);
+  plan.epoch_coloring = options.enable_epoch_coloring && plan.epoch_modulus > 1;
+  if (!plan.epoch_coloring) {
+    plan.epoch_modulus = 1;
+  }
+
+  plan.madvise_reclaim = options.enable_madvise_reclaim;
+  plan.madvise_passes =
+      plan.madvise_reclaim ? std::max<size_t>(1, options.madvise_passes) : 0;
+  plan.vma_surgery = options.enable_vma_surgery;
+  plan.vma_passes =
+      plan.vma_surgery ? std::max<size_t>(1, options.vma_passes) : 0;
+  plan.process_vm_transfer = options.enable_process_vm_transfer;
+  plan.zero_copy_pipe = options.enable_zero_copy_pipe;
+  plan.memfd_alias = options.enable_memfd_alias;
+  plan.fork_tree = options.enable_fork_tree;
+  plan.fork_tree_depth =
+      plan.fork_tree ? std::min<size_t>(3, std::max<size_t>(1, options.fork_tree_depth))
+                     : 0;
+  plan.thp_ksm = options.enable_thp_ksm;
+  if (plan.thp_ksm) {
+    size_t thp_bytes = options.requested_thp_region_bytes;
+    if (thp_bytes == 0) {
+      thp_bytes = std::max(recommended_bytes, kHugePageSize);
+    }
+    plan.thp_region_bytes = AlignUp(std::max(thp_bytes, kHugePageSize), kHugePageSize);
+  }
   return plan;
 }
 
