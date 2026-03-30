@@ -19,9 +19,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <thread>
 
@@ -49,9 +52,36 @@ ABSL_FLAG(bool, ignore_affinity_failure, false,
 namespace gvisor {
 namespace {
 const size_t kPageSize = sysconf(_SC_PAGESIZE);
+std::atomic<uint64_t> g_cache_sink(0);
 
 size_t RoundUpToPageSize(size_t k) {
   return ((k + kPageSize - 1) / kPageSize) * kPageSize;
+}
+
+uint8_t RotateLeft(uint8_t value) {
+  return static_cast<uint8_t>((value << 1) | (value >> 7));
+}
+
+uint8_t StressByte(uint8_t value, uint8_t salt, size_t position) {
+  const uint8_t lane =
+      static_cast<uint8_t>(((position * 17u) + (position >> 2)) & 0xffu);
+  return RotateLeft(static_cast<uint8_t>(value + salt + lane));
+}
+
+void PrefetchRead(const uint8_t *ptr) {
+#if defined(__clang__) || defined(__GNUC__)
+  __builtin_prefetch(ptr, 0, 3);
+#else
+  (void)ptr;
+#endif
+}
+
+void PrefetchWrite(const uint8_t *ptr) {
+#if defined(__clang__) || defined(__GNUC__)
+  __builtin_prefetch(ptr, 1, 3);
+#else
+  (void)ptr;
+#endif
 }
 
 }  // namespace
@@ -74,12 +104,21 @@ bool SprayPaint::TrySetAffinity(int lpu) {
   return true;
 }
 
-SprayPaint::SprayPaint(size_t buffer_size)
+SprayPaint::SprayPaint(size_t buffer_size, StressPlan stress_plan)
     : buffer_size_(std::max<size_t>(buffer_size, kMappedBufferSize)),
+      stress_plan_(stress_plan),
       buffer_(static_cast<uint8_t *>(
-          aligned_alloc(kPageSize, RoundUpToPageSize(buffer_size_)))) {
+          aligned_alloc(kPageSize, RoundUpToPageSize(buffer_size_)))),
+      load_store_source_(stress_plan_.load_store_passes == 0
+                             ? 0
+                             : RoundUpToPageSize(stress_plan_.load_store_bytes)),
+      load_store_target_(load_store_source_.size()) {
+  if (buffer_ == nullptr) {
+    SAFELOG(FATAL) << "Failed to allocate primary buffer";
+  }
   SetKid(0);
   Paint();
+  CacheHotlineBuffer(buffer_, buffer_size_);
   for (int k = 0; k < 3; k++) {
     if (!ColorIsRight("Ctor")) {
       SAFELOG(FATAL) << "Failed to color papa buffer right";
@@ -97,8 +136,10 @@ void SprayPaint::SetKid(int kid) { kid_ = kid; }
 
 void SprayPaint::CowPoke() {
   for (size_t k = 0; k < buffer_size_; k += kPageSize) {
-    // Pick an arbitrary position in the page.
-    const size_t kk = k + (k % kPageSize);
+    const size_t page = k / kPageSize;
+    const size_t offset =
+        (page * 131 + stress_plan_.cache_line_size) % kPageSize;
+    const size_t kk = k + offset;
     buffer_[kk] = TwoColor::Color(last_painted_by_, 0, kk);
   }
 }
@@ -131,7 +172,6 @@ void SprayPaint::Writer(int round, int fd) const {
   std::seed_seq seed{static_cast<uint64_t>(kid_), static_cast<uint64_t>(round)};
   std::knuth_b rng(seed);
   size_t p = 0;
-  int chunk_count = 0;
   while (p < buffer_size_) {
     size_t remaining = buffer_size_ - p;
     size_t longest = std::min<size_t>(remaining, kMaxTransfer);
@@ -141,12 +181,8 @@ void SprayPaint::Writer(int round, int fd) const {
       SAFELOG(FATAL) << "Kid: " << kid_ << " write failed: " << strerror(errno);
     }
     p += rc;
-    chunk_count++;
   }
   close(fd);
-  // if (kid_ == 1) {
-  //  VSAFELOG(3) << "Num writer chunks: " << chunk_count;
-  // }
 }
 
 bool SprayPaint::Reader(int round, int fd) const {
@@ -154,7 +190,6 @@ bool SprayPaint::Reader(int round, int fd) const {
   std::knuth_b rng(seed);
   size_t p = 0;
   uint8_t v[kMaxTransfer];
-  int chunk_count = 0;
   int64_t failures = 0;
   constexpr int kSpewLimit = 500;
   while (p < buffer_size_) {
@@ -164,8 +199,15 @@ bool SprayPaint::Reader(int round, int fd) const {
     if (rc < 0) {
       SAFELOG(FATAL) << "Kid: " << kid_ << " read failed: " << strerror(errno);
     }
+    if (rc == 0) {
+      SAFELOG(ERROR) << "Kid: " << kid_ << " unexpected EOF after " << p
+                     << " of " << buffer_size_ << " bytes";
+      close(fd);
+      return true;
+    }
+    const size_t bytes_read = static_cast<size_t>(rc);
     Summarizer summarizer(Ident("Pipe", 0), this, v);
-    for (size_t k = 0; k < rc; k++) {
+    for (size_t k = 0; k < bytes_read; k++) {
       if (v[k] != buffer_[p]) {
         failures += 1;
         if (failures < kSpewLimit) {
@@ -175,15 +217,11 @@ bool SprayPaint::Reader(int round, int fd) const {
       p++;
     }
     summarizer.Finish();
-    chunk_count++;
   }
   close(fd);
   if (failures > 0) {
     SAFELOG(ERROR) << "Total Pipe failures: " << failures;
   }
-  // if (kid_ == 1) {
-  //  VSAFELOG(3) << "Num reader chunks: " << chunk_count;
-  // }
   return failures > 0;
 }
 
@@ -198,7 +236,7 @@ uint8_t *SprayPaint::MappedBuffer(size_t id) const {
   uint8_t *buffer = static_cast<uint8_t *>(p);
   bool dirty = false;
   Summarizer summarizer(Ident("Mapped", id), this, buffer);
-  for (int k = 0; k < kMappedBufferSize; k++) {
+  for (size_t k = 0; k < kMappedBufferSize; k++) {
     const uint8_t color = buffer[k];
     if (color) {
       dirty = true;
@@ -209,10 +247,99 @@ uint8_t *SprayPaint::MappedBuffer(size_t id) const {
   summarizer.Finish();
   if (dirty) {
     SAFELOG(ERROR) << "Dirty map for kid: " << kid_;
+    munmap(buffer, kMappedBufferSize);
     return nullptr;
   }
-  mprotect(buffer, kMappedBufferSize, PROT_READ | PROT_WRITE);
+  if (mprotect(buffer, kMappedBufferSize, PROT_READ | PROT_WRITE) != 0) {
+    SAFELOG(ERROR) << "mprotect: " << strerror(errno);
+    munmap(buffer, kMappedBufferSize);
+    return nullptr;
+  }
+  CacheHotlineBuffer(buffer, kMappedBufferSize);
   return buffer;
+}
+
+void SprayPaint::CacheHotlineBuffer(const uint8_t *buffer,
+                                    size_t buffer_size) const {
+  if (!stress_plan_.cache_hotline || buffer == nullptr || buffer_size == 0) {
+    return;
+  }
+
+  const size_t line_size = std::max<size_t>(1, stress_plan_.cache_line_size);
+  uint64_t sink = 0;
+  for (size_t pass = 0; pass < stress_plan_.cache_hotline_passes; ++pass) {
+    for (size_t pos = 0; pos < buffer_size; pos += line_size) {
+      const size_t next = std::min(buffer_size - 1, pos + line_size);
+      PrefetchRead(buffer + next);
+      sink += buffer[(pos + pass) % buffer_size];
+    }
+    size_t tail = buffer_size;
+    while (tail > 0) {
+      tail = tail > line_size ? tail - line_size : 0;
+      PrefetchRead(buffer + tail);
+      sink += buffer[tail];
+      if (tail == 0) {
+        break;
+      }
+    }
+  }
+  g_cache_sink.fetch_add(sink, std::memory_order_relaxed);
+}
+
+bool SprayPaint::RunLoadStoreStress(int round) {
+  if (stress_plan_.load_store_passes == 0 || load_store_source_.empty()) {
+    return true;
+  }
+
+  const size_t line_size = std::max<size_t>(1, stress_plan_.cache_line_size);
+  const size_t identity = static_cast<size_t>(kid_ + 1 + round * 7);
+  for (size_t pos = 0; pos < load_store_source_.size(); ++pos) {
+    load_store_source_[pos] = static_cast<uint8_t>(
+        TwoColor::Color(identity, round % TwoColor::kPeriod, pos) ^
+        static_cast<uint8_t>((pos * 13u + round) & 0xffu));
+    load_store_target_[pos] = 0;
+  }
+
+  CacheHotlineBuffer(load_store_source_.data(), load_store_source_.size());
+
+  uint64_t sink = 0;
+  for (size_t pass = 0; pass < stress_plan_.load_store_passes; ++pass) {
+    const uint8_t salt =
+        static_cast<uint8_t>((kid_ * 29 + round * 17 + pass * 13) & 0xffu);
+    for (size_t base = 0; base < load_store_source_.size(); base += line_size) {
+      const size_t next = std::min(load_store_source_.size() - 1, base + line_size);
+      PrefetchRead(load_store_source_.data() + next);
+      PrefetchWrite(load_store_target_.data() + next);
+      const size_t limit = std::min(load_store_source_.size(), base + line_size);
+      for (size_t pos = base; pos < limit; ++pos) {
+        const uint8_t transformed =
+            StressByte(load_store_source_[pos], salt, pos + pass * line_size);
+        load_store_target_[pos] = transformed;
+        sink += transformed;
+      }
+    }
+
+    size_t tail = load_store_target_.size();
+    while (tail > 0) {
+      const size_t base = tail > line_size ? tail - line_size : 0;
+      for (size_t pos = base; pos < tail; ++pos) {
+        const uint8_t expected =
+            StressByte(load_store_source_[pos], salt, pos + pass * line_size);
+        if (load_store_target_[pos] != expected) {
+          SAFELOG(ERROR) << "Round: " << round_ << " kid: " << kid_
+                         << " load/store mismatch at " << pos
+                         << " expected: " << static_cast<int>(expected)
+                         << " saw: " << static_cast<int>(load_store_target_[pos]);
+          return false;
+        }
+        sink += load_store_target_[pos];
+      }
+      tail = base;
+    }
+    load_store_source_.swap(load_store_target_);
+  }
+  g_cache_sink.fetch_add(sink, std::memory_order_relaxed);
+  return true;
 }
 
 std::string SprayPaint::Ident(const std::string &phase,
@@ -253,7 +380,16 @@ int SprayPaint::Kid(int round, int kid) {
       return 1;
     }
 
-    mprotect(buffer_, buffer_size_, PROT_READ | PROT_WRITE);
+    CacheHotlineBuffer(buffer_, buffer_size_);
+    if (!RunLoadStoreStress(round)) {
+      SAFELOG(ERROR) << "Load/store stress failed for kid: " << kid_;
+      return 1;
+    }
+
+    if (mprotect(buffer_, buffer_size_, PROT_READ | PROT_WRITE) != 0) {
+      SAFELOG(ERROR) << "mprotect: " << strerror(errno);
+      return 1;
+    }
 
     std::vector<uint8_t *> mapping;
     mapping.reserve(kMappings);
@@ -338,7 +474,8 @@ std::string Summarizer::Summary() const {
   auto r = TwoColor::Identify(buffer_ + range_start_, range_length);
   constexpr size_t kThreshold = 6;
   if (r.has_value()) {
-    if (r->identity != spray_paint_->GetKid() && r->identity != 0 &&
+    if (r->identity != static_cast<size_t>(spray_paint_->GetKid()) &&
+        r->identity != 0 &&
         r->length > kThreshold) {
       v.push_back(absl::StrFormat("*** Indiscretion %s from Kid: %d Length: %d",
                                   ident_, r->identity, r->length));
@@ -381,5 +518,7 @@ void Summarizer::Finish() const {
   }
 }
 
-bool Summarizer::IsSquelched() const { return total_fails_ >= kSpewLimit; }
+bool Summarizer::IsSquelched() const {
+  return total_fails_ >= static_cast<int64_t>(kSpewLimit);
+}
 }  // namespace gvisor

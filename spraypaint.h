@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "system_topology.h"
 #include "two_color.h"
 
 namespace gvisor {
@@ -29,7 +30,7 @@ namespace gvisor {
 // through enclosing kernel or hypervisor.
 class SprayPaint {
  public:
-  explicit SprayPaint(size_t buffer_size);
+  explicit SprayPaint(size_t buffer_size, StressPlan stress_plan = {});
   virtual ~SprayPaint();
 
   // Checks and exercises, intended for child processes.
@@ -44,6 +45,7 @@ class SprayPaint {
   // Returns decoded color (as modular values), or 'Garbage' if invalid.
   std::string CrackColor(uint8_t color) const;
   const uint8_t *buffer() const { return buffer_; }
+  size_t buffer_size() const { return buffer_size_; }
 
   // Accessor to class static variable kMappedBufferSize
   static const size_t GetMappedBufferSize() { return kMappedBufferSize; }
@@ -77,15 +79,21 @@ class SprayPaint {
   // Returns null_ptr on error.
   uint8_t *MappedBuffer(size_t id) const;
 
+  void CacheHotlineBuffer(const uint8_t *buffer, size_t buffer_size) const;
+  bool RunLoadStoreStress(int round);
+
   std::string Ident(const std::string &phase, size_t buffer_id) const;
 
   std::string ErrorMessage(uint8_t color, size_t position) const;
 
   const size_t buffer_size_;
+  const StressPlan stress_plan_;
   int round_ = 0;
   int kid_ = 0;
   int last_painted_by_ = 0;
   uint8_t *buffer_;
+  std::vector<uint8_t> load_store_source_;
+  std::vector<uint8_t> load_store_target_;
 };
 
 // Summarizes and logs corruption, tries to avoid giant log spew.

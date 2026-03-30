@@ -15,6 +15,7 @@
 #include "two_color.h"
 
 #include <cstdint>
+#include <cstring>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -113,4 +114,3 @@ TEST(CrackColor, Root) {
 }
 }  // namespace
 }  // namespace gvisor
-

@@ -30,6 +30,55 @@ sh$ cmake --build . --target rainbow
 ```
 Note that rainbow must be built with the C++17 standard.
 
+### Docker build
+
+The repository includes a multi-stage `Dockerfile` that builds a static
+`rainbow` binary and runs the test suite inside the builder stage.
+
+```
+sh$ docker build -t rainbow:static .
+sh$ sh ./export-static.sh rainbow:static ./rainbow
+```
+
+## Prescan and CPU stress
+
+Rainbow now supports a prescan-only mode plus an opt-in deterministic
+load/store phase to push CPU and cache paths harder.
+
+Because this tool can destabilize a machine, start with `--prescan_only`,
+then a short run with `--kids=1`, and only enable the heavier knobs when the
+host stays stable.
+
+Useful flags:
+
+* `--prescan_only`: print detected CPU/cache topology and the derived stress plan.
+* `--prescan_topology=true|false`: enable or disable Linux `/sys` topology scan.
+* `--cache_hotline=true|false`: warm cache lines before validation. Disabled by
+  default for safer bring-up.
+* `--cache_hotline_passes=N`: number of cache hotlining passes per buffer.
+* `--load_store_passes=N`: number of extra deterministic load/store passes per
+  child. Disabled by default for safer bring-up.
+* `--load_store_bytes=BYTES`: working-set size for the load/store phase; `0`
+  derives a value from the prescan results.
+
+Example:
+
+```
+sh$ ./build/rainbow --prescan_only
+sh$ ./build/rainbow --run_time=30s --kids=1
+sh$ ./build/rainbow --run_time=30s --kids=8 --load_store_passes=8 \
+       --cache_hotline=true --cache_hotline_passes=2 \
+       --load_store_bytes=$((4 * 1024 * 1024))
+```
+
+## CI and release
+
+GitHub Actions now builds the project through the Docker container on pull
+requests, pushes to `main`, and tag pushes matching `v*`.
+
+On tag pushes, the workflow exports the static binary and uploads it to the
+GitHub Releases page so teammates can download the artifact directly.
+
 ## Future updates
 
 * Update instruction to run rainbow with gVisor to provoke hypervisor.
