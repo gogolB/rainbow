@@ -14,6 +14,8 @@
 
 #include "spraypaint.h"
 
+#include <unistd.h>
+
 #include <cstddef>
 
 #include "gmock/gmock.h"
@@ -24,8 +26,8 @@ namespace {
 
 class MockSprayPaintTest : public  SprayPaint {
  public:
-  explicit MockSprayPaintTest(size_t buffer_size)
-      : SprayPaint(buffer_size) {
+  explicit MockSprayPaintTest(size_t buffer_size, StressPlan stress_plan = {})
+      : SprayPaint(buffer_size, stress_plan) {
   }
   ~MockSprayPaintTest() override = default;
   MOCK_METHOD(bool, TrySetAffinity, (int lpu), (override));
@@ -40,6 +42,19 @@ TEST(MockSprayPaintTest, KidTrySetAffinityPass) {
 TEST(MockSprayPaintTest, KidTrySetAffinityFail) {
   MockSprayPaintTest spray_paint(10000);
   EXPECT_CALL(spray_paint, TrySetAffinity).WillOnce(testing::Return(false));
+  EXPECT_EQ(spray_paint.Kid(11, 2), 0);
+}
+
+TEST(MockSprayPaintTest, KidStressPlanPass) {
+  StressPlan stress_plan;
+  stress_plan.cache_line_size = 64;
+  stress_plan.cache_hotline = true;
+  stress_plan.cache_hotline_passes = 2;
+  stress_plan.load_store_bytes = 256 * 1024;
+  stress_plan.load_store_passes = 2;
+
+  MockSprayPaintTest spray_paint(10000, stress_plan);
+  EXPECT_CALL(spray_paint, TrySetAffinity).WillOnce(testing::Return(true));
   EXPECT_EQ(spray_paint.Kid(11, 2), 0);
 }
 
